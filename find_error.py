@@ -4,30 +4,20 @@ import gc
 import logging
 import math
 import os
-import subprocess
 import sys
-from math import ceil, floor
 
-import fiona
 import geopandas as gpd
 import numpy as np
-import osgeo
 import pandas as pd
-import pycrs
+import pyproj
 import rasterio
 import rasterio.mask
 import rasterio.rio
-from fiona.crs import from_epsg
+from geographiclib.geodesic import Geodesic
 
 # import shapefile
-from osgeo import gdal, ogr, osr
-from pyproj import Proj
-from rasterio.mask import mask
-from rasterio.merge import merge
-from rasterio.plot import show, show_hist
-from shapely.geometry import box
-
-import common
+from osgeo import gdal, ogr
+from pyproj import Proj, Transformer
 
 logging.getLogger().setLevel(logging.INFO)
 
@@ -40,7 +30,6 @@ from scipy import ndimage as nd
 
 SCRIPTS_DIR = os.path.join(os.path.dirname(sys.executable))
 sys.path.append(SCRIPTS_DIR)
-import osgeo_utils.gdal_merge as gm
 
 
 def fill(data, invalid=None):
@@ -71,6 +60,14 @@ def fill(data, invalid=None):
 
 CRS_WGS84 = 4326
 CRS_LAMBERT_ATLAS = 3978
+CRS_ALBERS_NA = 102008
+
+CRS_TO_TRY = {
+    CRS_LAMBERT_ATLAS: f"epsg:{CRS_LAMBERT_ATLAS}",
+    CRS_ALBERS_NA: 'PROJCS["North_America_Albers_Equal_Area_Conic",GEOGCS["NAD83",DATUM["North_American_Datum_1983",SPHEROID["GRS 1980",6378137,298.257222101,AUTHORITY["EPSG","7019"]],AUTHORITY["EPSG","6269"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]],AUTHORITY["EPSG","4269"]],PROJECTION["Albers_Conic_Equal_Area"],PARAMETER["latitude_of_center",40],PARAMETER["longitude_of_center",-96],PARAMETER["standard_parallel_1",20],PARAMETER["standard_parallel_2",60],PARAMETER["false_easting",0],PARAMETER["false_northing",0],UNIT["metre",1,AUTHORITY["EPSG","9001"]],AXIS["Easting",EAST],AXIS["Northing",NORTH],AUTHORITY["ESRI","102008"]]',
+}
+
+
 KM_TO_M = 1000
 BUFFER_KM = 100 * KM_TO_M
 
@@ -141,9 +138,6 @@ def make_hexel(hexel):
     logging.info("Hexel {}: Done".format(hexel.hex))
     gc.collect()
 
-
-import multiprocessing
-from multiprocessing import Pool
 
 # if __name__ == "__main__":
 #     if not os.path.exists(INT_FUEL):
@@ -245,26 +239,30 @@ def fix_nodata(out_tif, no_data=None):
     ds = None
 
 
-fp = FUEL_RASTER
-# def check_error(fp=FUEL_RASTER):
-# out_tif = os.path.join(DIR, f"error_{os.path.basename(fp)}")
-out_tif = os.path.join(DIR, f"error_{CELL_SIZE_OUT}m.tif")
-if not os.path.exists(out_tif):
-    logging.info(f"Finding error for {fp}")
+def check_error(crs, fp=FUEL_RASTER):
+    # out_tif = os.path.join(DIR, f"error_{os.path.basename(fp)}")
+    out_tif = os.path.join(DIR, f"error_{CELL_SIZE_OUT}m_{crs}.tif")
+    # just delete for now since we need all these properties for later
+    if os.path.exists(out_tif):
+        os.remove(out_tif)
+    logging.info(f"Finding error for {fp} in crs {crs}")
     ds = gdal.Open(fp)
     # out_image = None
     # out_transform = None
-    # data = rasterio.open(fp)
-    # srcWkt = data.crs.wkt
-    # data.close()
+    data = rasterio.open(fp)
+    srcWkt = data.crs.wkt
+    data.close()
     # srcSRS = osr.SpatialReference()
-    # srcSRS.ImportFromWkt(data.crs.wkt)
+    # srcSRS.ImportFromWkt(data....wkt)
     # dstSRS = osr.SpatialReference()
     # dstSRS.ImportFromWkt(wkt)
     rb = ds.GetRasterBand(1)
     no_data = rb.GetNoDataValue()
     rb = None
     # wkt, meridian = wkt_from_hexel(hexel.hex, hexel.meridian)
+    # srs = pyproj.CRS({"init": CRS_TO_TRY[crs]})
+    # srs = Proj(CRS_TO_TRY[crs])
+    # dstWkt = srs.to_wkt()
     # proj_srs = osr.SpatialReference(wkt=wkt)
     # toProj = Proj(proj_srs.ExportToProj4())
     # lon = (hexel.minx, hexel.maxx)
@@ -282,6 +280,10 @@ if not os.path.exists(out_tif):
         creationOptions=CREATION_OPTIONS,
         xRes=CELL_SIZE_OUT,
         yRes=CELL_SIZE_OUT,
+        srcSRS=srcWkt,
+        dstSRS=CRS_TO_TRY[crs],
+        # dstSRS=srs.to_wkt(),
+        # dstSRS=f"EPSG:{crs}",
     )
     ds = None
     # fix_nodata(out_tif)
@@ -312,34 +314,22 @@ if not os.path.exists(out_tif):
     ds = None
     # return out_tif
 
+    def to_gdf(df, crs=CRS_WGS84):
+        geometry = df["geometry"] if "geometry" in df else gpd.points_from_xy(df["lon"], df["lat"], crs=crs)
+        return gpd.GeoDataFrame(df, crs=crs, geometry=geometry)
 
-import geopandas as gpd
-import numpy as np
-import pandas as pd
-import pyproj
-import rasterio
-from pyproj import Transformer
-from shapely.geometry import Point
+    gc.collect()
 
+    def xy_to_latlong(x, y):
+        # row, column
+        xs, ys = rasterio.transform.xy(src.transform, y, x)
+        lon, lat = transformer.transform(np.array(xs), np.array(ys))
+        return lon, lat
 
-def to_gdf(df, crs=CRS_WGS84):
-    geometry = df["geometry"] if "geometry" in df else gpd.points_from_xy(df["lon"], df["lat"], crs=crs)
-    return gpd.GeoDataFrame(df, crs=crs, geometry=geometry)
-
-
-gc.collect()
-
-
-def xy_to_latlong(x, y):
-    # row, column
-    xs, ys = rasterio.transform.xy(src.transform, y, x)
-    lon, lat = transformer.transform(np.array(xs), np.array(ys))
-    return lon, lat
-
-
-file_out = out_tif.replace(".tif", ".parquet")
-# file_out = out_tif.replace(".tif", ".gpkg")
-if not os.path.exists(file_out):
+    file_out = out_tif.replace(".tif", ".parquet")
+    # file_out = out_tif.replace(".tif", ".gpkg")
+    if os.path.exists(file_out):
+        os.remove(file_out)
     # need to look at resampled raster, not original
     with rasterio.open(out_tif) as src:
         band1 = src.read(1)
@@ -374,68 +364,65 @@ if not os.path.exists(file_out):
         # out = gpd.GeoDataFrame(
         #     {'feature': features, 'geometry': geoms}, crs=src.crs)
         # out.to_file("pixel_center_points.shp")
-# gdf = gpd.read_file(file_out)
-gdf = gpd.read_parquet(file_out)
+    # gdf = gpd.read_file(file_out)
+    gdf = gpd.read_parquet(file_out)
 
-gdf["lon_int"] = gdf["lon"].astype(int)
+    gdf["lon_int"] = gdf["lon"].astype(int)
 
-from geographiclib.geodesic import Geodesic
+    def point_from_offset(p1, offset_x, offset_y):
+        lon1, lat1 = xy_to_latlong(p1.x, p1.y)
+        assert lon1 == p1.lon
+        assert lat1 == p1.lat
+        lon2, lat2 = xy_to_latlong(p1.x + offset_x, p1.y + offset_y)
+        return lon2, lat2
+
+    def find_inverse(p1, offset_x, offset_y):
+        lon2, lat2 = point_from_offset(p1, offset_x, offset_y)
+        inv = Geodesic.WGS84.Inverse(p1.lat, p1.lon, lat2, lon2)
+        return inv
+
+    # def find_distance(p1, offset_x, offset_y):
+    #     return find_inverse(p1, offset_x, offset_y)["s12"]
+
+    # def find_bearing(p1, offset_x, offset_y):
+    #     return find_inverse(p1, offset_x, offset_y)["a12"]
+
+    def find_bearing_distance(p1, offset_x, offset_y):
+        inv = find_inverse(p1, offset_x, offset_y)
+        return inv["azi1"], inv["s12"]
+
+    gdf_orig = gdf
+
+    # reset to gdf_orig to make copy/paste easier
+    gdf = gdf_orig
+
+    # NOTE: this is way more duplication of effort, but lets us get cells outside raster along edges without doing anything differently
+    # (0, 0) cell is top left corner
+    gdf[["bearing_down", "distance_down"]] = gdf.apply(
+        lambda p1: find_bearing_distance(p1, 0, 1),
+        axis=1,
+        result_type="expand",
+    )
+    gdf[["bearing_up", "distance_up"]] = gdf.apply(
+        lambda p1: find_bearing_distance(p1, 0, -1),
+        axis=1,
+        result_type="expand",
+    )
+    gdf[["bearing_left", "distance_left"]] = gdf.apply(
+        lambda p1: find_bearing_distance(p1, -1, 0),
+        axis=1,
+        result_type="expand",
+    )
+    gdf[["bearing_right", "distance_right"]] = gdf.apply(
+        lambda p1: find_bearing_distance(p1, 1, 0),
+        axis=1,
+        result_type="expand",
+    )
+
+    gdf.to_parquet(out_tif.replace(".tif", ".parquet"))
+    return gdf
 
 
-def point_from_offset(p1, offset_x, offset_y):
-    lon1, lat1 = xy_to_latlong(p1.x, p1.y)
-    assert lon1 == p1.lon
-    assert lat1 == p1.lat
-    lon2, lat2 = xy_to_latlong(p1.x + offset_x, p1.y + offset_y)
-    return lon2, lat2
-
-
-def find_inverse(p1, offset_x, offset_y):
-    lon2, lat2 = point_from_offset(p1, offset_x, offset_y)
-    inv = Geodesic.WGS84.Inverse(p1.lat, p1.lon, lat2, lon2)
-    return inv
-
-
-# def find_distance(p1, offset_x, offset_y):
-#     return find_inverse(p1, offset_x, offset_y)["s12"]
-
-
-# def find_bearing(p1, offset_x, offset_y):
-#     return find_inverse(p1, offset_x, offset_y)["a12"]
-
-
-def find_bearing_distance(p1, offset_x, offset_y):
-    inv = find_inverse(p1, offset_x, offset_y)
-    return inv["azi1"], inv["s12"]
-
-
-gdf_orig = gdf
-
-
-# reset to gdf_orig to make copy/paste easier
-gdf = gdf_orig
-
-# NOTE: this is way more duplication of effort, but lets us get cells outside raster along edges without doing anything differently
-# (0, 0) cell is top left corner
-gdf[["bearing_down", "distance_down"]] = gdf.apply(
-    lambda p1: find_bearing_distance(p1, 0, 1),
-    axis=1,
-    result_type="expand",
-)
-gdf[["bearing_up", "distance_up"]] = gdf.apply(
-    lambda p1: find_bearing_distance(p1, 0, -1),
-    axis=1,
-    result_type="expand",
-)
-gdf[["bearing_left", "distance_left"]] = gdf.apply(
-    lambda p1: find_bearing_distance(p1, -1, 0),
-    axis=1,
-    result_type="expand",
-)
-gdf[["bearing_right", "distance_right"]] = gdf.apply(
-    lambda p1: find_bearing_distance(p1, 1, 0),
-    axis=1,
-    result_type="expand",
-)
-
-gdf.to_parquet(out_tif.replace(".tif", ".parquet"))
+gdfs = {}
+for crs in CRS_TO_TRY.keys():
+    gdfs[crs] = check_error(crs)
